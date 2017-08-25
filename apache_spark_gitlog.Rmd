@@ -1,0 +1,323 @@
+---
+title: "Apache Spark Authors"
+author: "Augustina Ragwitz"
+date: "August 25, 2017"
+output: html_document
+params:
+  git_path: "spark"
+  gitlog_sha: '628bdeabda'
+  gitlog_out: 'data/apache_spark_gitlog.txt'
+  gh_id: !r Sys.getenv("API_KEY_GITHUB_ID")
+  gh_secret: !r Sys.getenv("API_KEY_GITHUB_SECRET")
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(tidyr)
+library(zoo)
+```
+
+```{r git_log}
+git_log_cmd <- paste0('cd ', params$git_path, 
+                     '; git log ', params$gitlog_sha, 
+                     #' --no-merges ',
+                     ' --date=short --pretty=tformat:"%ad|%an|%ae|%h" > ../', params$gitlog_out)
+system(git_log_cmd)
+
+git_log_cmd
+```
+
+
+```{r gitlog_raw}
+gitlog_raw <- read.csv(params$gitlog_out, header = FALSE, sep = "|", quote="",
+                     col.names=c("git_log_date", "name", "email", "sha"),
+                   stringsAsFactors = FALSE)
+
+# add date formatting so these sort properly
+gitlog_parsed_dates <- gitlog_raw %>% 
+  mutate(commit_date=as.Date(git_log_date, tz="UTC"),
+         commit_month=as.yearmon(commit_date),
+         name=str_to_lower(name),
+         email=str_to_lower(email)) %>% 
+  select(commit_date, commit_month, name, email, sha)
+```
+
+```{r parsed_emails}
+# manual updates for known authors that make things complicated
+# TODO create table from commits_github_login and merge instead
+gitlog_parsed_emails <- gitlog_parsed_dates %>% 
+  mutate(
+    email=str_replace_all(email, "[“”]", ""),
+    name=str_replace(name, "anabranch", "bill chambers"),
+    name=str_replace(name, "kun li| likun", "jacky li"),
+    name=ifelse(email=="nongli@gmail.com", "nong li", name),
+    name=ifelse(email=="root@ip-10-226-118-223.ec2.internal", "matei zaharia", name),
+    name=as.character(ifelse(!is.na(str_match(name, "tom graves|tgraves")), "thomas graves", name))
+  )
+
+# known email provider domains
+email_provider_domains <- c("gmail.com", 
+                            "users.noreply.github.com",
+                            "hotmail.com",
+                            "googlemail.com",
+                            "qq.com",
+                            "126.com",
+                            "163.com",
+                            "outlook.com",
+                            "me.com",
+                            "live.com",
+                            "yahoo.com", # manual verification showed these are not yahoo employees
+                            "yahoo.fr",
+                            "yahoo.de",
+                            "foxmail.com",
+                            "protonmail.com",
+                            "msn.com",
+                            "mail.com",
+                            "comcast.net",
+                            "apache.org") # this is an address provided by apache that obscures affiliation
+```
+
+
+```{r fix_email_hosts}
+
+# Manually fix some hostnames that come from the same place. 
+#  This should be improved by a) turning it into a function that takes a list of institutions and/or 
+#  b) identifying emails that fall into this pattern
+
+gitlog_fixed_hosts <- gitlog_parsed_emails %>%
+  mutate(fixed_email=str_replace(email, 
+                                 "(@)(.*)(ibm\\.com)", 
+                                 "\\1\\3")) %>%
+  mutate(fixed_email=ifelse(fixed_email==email, NA, fixed_email))
+
+# double check what got changed
+email_check <- gitlog_fixed_hosts %>% 
+  filter(!is.na(fixed_email)) %>% 
+  select(email, fixed_email) %>% 
+  unique()
+
+email_check
+
+# if it looks good then update the email address
+gitlog_parsed_emails <- gitlog_fixed_hosts %>%
+  mutate(email=ifelse(!is.na(fixed_email), fixed_email, email)) %>%
+  select(-fixed_email)
+
+```
+
+
+```{r normalize_authors}
+# create an authoritative email address
+# all matching emails should have the same sha
+gh_authors_by_email <- gitlog_parsed_emails %>%
+  arrange(desc(commit_date)) %>%
+  group_by(email, name) %>%
+  summarise(num_commits = n(), 
+            last_commit=max(commit_date))
+
+source("normalize_authors.R")
+gh_authors_lookup <- build_authors_lookup(gh_authors_by_email, email_provider_domains)
+
+```
+
+```{r set_ibm}
+
+gh_authors_lookup_ibm <- gh_authors_lookup %>%
+  filter(!is.na(str_match(email, "ibm.com")) & email_id_host != "ibm.com")
+
+paste("IBM authors assigned different email_id (should be zero):", nrow(gh_authors_lookup_ibm))
+
+```
+
+```{r update_commits}
+gitlog_parsed_authors <- merge(gitlog_parsed_emails, gh_authors_lookup, by=c("email"), all=TRUE)
+gitlog_parsed_authors <- unique(gitlog_parsed_authors)
+
+# check that each SHA only has one author
+gitlog_parsed_authors_check <- gitlog_parsed_authors %>% group_by(sha) %>% mutate(n=n()) %>% filter(n>1)
+
+# TODO use an assert
+paste("Commits with more than one author (should be zero):", nrow(gitlog_parsed_authors_check))
+
+```
+
+```{r exclude_month}
+# exclude current/incomplete months for summaries
+gitlog_parsed <- gitlog_parsed_authors # %>% filter(commit_month < "July 2017")
+```
+
+# Data Summaries
+
+## Commit Months
+
+Commits are grouped by month and author to determine frequencies. Commit frequency bins are created using the rounded natural log of the total commits for the author. The output is a list of total commits and authors per month.
+
+```{r summaries_by_month}
+
+# total number of commits per month (used for %)
+total_commits_per_month <- gitlog_parsed %>% group_by(commit_month) %>% 
+  summarise(num_commits=n())
+
+# commits per author
+commits_per_author <- gitlog_parsed %>% 
+  group_by(commit_month, author) %>% 
+  summarise(num_author_commits=n(), 
+            email_id_host=first(email_id_host)
+  ) %>%
+  group_by(author) %>% # number of months the author has commits for
+  mutate(num_months=n()) %>%
+  group_by(commit_month) %>% # total authors per month
+  mutate(num_authors=n())
+
+commits_summary <- total_commits_per_month %>% 
+  inner_join(commits_per_author, by="commit_month") %>%
+  mutate(commits_pct = num_author_commits/num_commits) # determine percent using total commits
+
+# Authors with just one commit month
+single_month_authors <- commits_per_author %>% 
+  filter(num_months == 1) %>%
+  group_by(commit_month) %>%
+  summarise(num_authors_single=n())
+
+commits_summary <- commits_summary %>% inner_join(single_month_authors, by="commit_month")
+
+# clean up
+rm(total_commits_per_month, single_month_authors)
+```
+
+```{r host_summaries}
+
+# commits per month by host
+commits_summary <- commits_summary %>%
+  group_by(commit_month, email_id_host) %>%
+  mutate(
+    num_host_commits = sum(num_author_commits),
+    num_host_authors = n_distinct(author)
+  ) %>%
+  group_by(email_id_host) %>%
+  mutate(
+    num_host_months = n_distinct(commit_month),
+    total_host_authors = sum(num_host_authors)) %>%
+  group_by(commit_month) %>%
+  mutate(num_hosts = n_distinct(email_id_host))
+```
+
+# Authors
+
+## Unique Authors per Month
+
+```{r, authors_per_month}
+ggplot(data = commits_summary, aes(x = factor(commit_month))) +
+  geom_point(aes(y = num_authors, color="Authors"), group=1) +
+  geom_line(aes(y = num_authors, color="Authors"), group=1) +
+  ylab("Count") +
+  xlab("Month") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+## Unique Email Domains per Month
+
+```{r, hosts_per_month}
+ggplot(data = commits_summary, aes(x = factor(commit_month))) +
+  geom_point(aes(y = num_hosts, color="Email Domains"), group=1) +
+  geom_line(aes(y = num_hosts, color="Email Domains"), group=1) +
+  ylab("Count") +
+  xlab("Month") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+## Proportion of Authors by Email Domain
+
+
+```{r, authors_by_host}
+
+ggplot(commits_summary %>% 
+         filter(email_id_host == "ibm.com"),
+       aes(x=factor(commit_month), 
+           y=num_host_authors, 
+           fill=reorder(email_id_host, -total_host_authors))) + 
+  geom_bar(stat="identity", position="stack") +
+  xlab("Months") +
+  ylab("Authors") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  guides(fill=guide_legend(title="Hosts", ncol=2))
+
+ggplot(commits_summary %>% 
+         mutate(is_ibm=ifelse(is.na(email_id_host) | email_id_host!="ibm.com", "Not IBM", "IBM")),
+       aes(x=factor(commit_month), 
+           y=num_host_authors, 
+           fill=is_ibm)) + 
+  geom_bar(stat="identity", position="dodge") +
+  xlab("Months") +
+  ylab("Authors") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  guides(fill=guide_legend(title="Hosts"))
+
+```
+
+```{r}
+
+ggplot(commits_summary %>% 
+         filter(commit_month > "Dec 2014" & commit_month < "Jan 2016",
+                email_id_host == "ibm.com"),
+       aes(x=factor(commit_month), 
+           y=num_host_authors, 
+           fill=author)) + 
+  geom_bar(stat="identity", position="stack") +
+  xlab("Months (2015)") +
+  ylab("Authors") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  guides(fill=guide_legend(title="Authors", ncol=3))
+
+ggplot(commits_summary %>% 
+         filter(commit_month > "Dec 2015" & commit_month < "Jan 2017",
+                email_id_host == "ibm.com"),
+       aes(x=factor(commit_month), 
+           y=num_host_authors, 
+           fill=author)) + 
+  geom_bar(stat="identity", position="stack") +
+  xlab("Months (2016)") +
+  ylab("Authors") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  guides(fill=guide_legend(title="Authors"))
+
+ggplot(commits_summary %>% 
+         filter(commit_month > "Dec 2016",
+                email_id_host == "ibm.com"),
+       aes(x=factor(commit_month), 
+           y=num_host_authors, 
+           fill=author)) + 
+  geom_bar(stat="identity", position="stack") +
+  xlab("Months (2017)") +
+  ylab("Authors") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  guides(fill=guide_legend(title="Authors"))
+
+```
+
+```{r}
+ibm_author_summary <- commits_summary %>% 
+         filter(email_id_host == "ibm.com") %>%
+         group_by(author) %>%
+         summarise(
+           num_months = first(num_months),
+           email_id_host=first(email_id_host)
+         )
+
+ggplot(ibm_author_summary,
+       aes(x=reorder(author, num_months), 
+           y=num_months, 
+           fill=email_id_host)) + 
+  geom_bar(stat="identity", position="stack") +
+  xlab("Authors") +
+  ylab("Commit Months") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  guides(fill=guide_legend(title="Host"))
+
+```
+
+
